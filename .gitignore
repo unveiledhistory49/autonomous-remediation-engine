@@ -1,0 +1,8 @@
+# Binaries
+bin/
+
+# Test / run artifacts
+*.log
+*.wal
+*.lock
+coverage.out
