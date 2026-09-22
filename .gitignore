@@ -7,5 +7,6 @@ bin/
 *.lock
 coverage.out
 
-# Internal design documentation
+# Internal documentation
 docs/
+DESIGN.md
