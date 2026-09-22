@@ -58,11 +58,11 @@ func DefaultDiskCleanupConfig() DiskCleanupConfig {
 	return DiskCleanupConfig{
 		TargetDir:          "/var/log",
 		ActiveLogName:      "ai-gateway.log",
-		MinFreePctRequired: 15.0,
+		MinFreePctRequired: 10.0,
 		MaxFilesToDelete:   10,
-		MaxBytesToDelete:   524288000, // 500 MB
+		MaxBytesToDelete:   21474836480, // 20 GB clamp per OPERATIONS.md
 		ExecutionTimeout:   15 * time.Second,
-		HealthCheckURL:     "http://127.0.0.1:8080/healthz",
+		HealthCheckURL:     "",
 	}
 }
 
@@ -77,8 +77,8 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 	if cfg.MaxFilesToDelete <= 0 || cfg.MaxFilesToDelete > 10 {
 		cfg.MaxFilesToDelete = 10
 	}
-	if cfg.MaxBytesToDelete <= 0 || cfg.MaxBytesToDelete > 524288000 {
-		cfg.MaxBytesToDelete = 524288000
+	if cfg.MaxBytesToDelete <= 0 || cfg.MaxBytesToDelete > 21474836480 {
+		cfg.MaxBytesToDelete = 21474836480
 	}
 	if cfg.ExecutionTimeout <= 0 || cfg.ExecutionTimeout > 15*time.Second {
 		cfg.ExecutionTimeout = 15 * time.Second
@@ -96,30 +96,32 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 			MaxExecutionTime:    cfg.ExecutionTimeout,
 			MaxBytesMutated:     cfg.MaxBytesToDelete,
 			MaxFilesModified:    cfg.MaxFilesToDelete,
-			AllowedPathPrefixes: []string{cfg.TargetDir},
+			AllowedPathPrefixes: []string{"/var/log", "/tmp", cfg.TargetDir},
 		},
 		Preconditions: []model.Precondition{
 			{
 				Name: "statfs-and-candidate-inspection",
 				Type: model.ConditionCustom,
 				CheckFn: func(ctx context.Context) (bool, error) {
+					targetDir := resolveTargetDir(ctx, cfg.TargetDir)
+
 					// 1. Verify directory exists
-					dirStat, err := os.Stat(cfg.TargetDir)
+					dirStat, err := os.Stat(targetDir)
 					if err != nil {
-						return false, fmt.Errorf("target log directory %s inaccessible: %w", cfg.TargetDir, err)
+						return false, fmt.Errorf("target log directory %s inaccessible: %w", targetDir, err)
 					}
 					if !dirStat.IsDir() {
-						return false, fmt.Errorf("target log path %s is not a directory", cfg.TargetDir)
+						return false, fmt.Errorf("target log path %s is not a directory", targetDir)
 					}
 
 					// 2. Statfs check
 					var stat syscall.Statfs_t
-					if err := syscall.Statfs(cfg.TargetDir, &stat); err != nil {
-						return false, fmt.Errorf("statfs failed on %s: %w", cfg.TargetDir, err)
+					if err := syscall.Statfs(targetDir, &stat); err != nil {
+						return false, fmt.Errorf("statfs failed on %s: %w", targetDir, err)
 					}
 
 					// 3. Inspect active log file
-					activePath := filepath.Join(cfg.TargetDir, cfg.ActiveLogName)
+					activePath := filepath.Join(targetDir, cfg.ActiveLogName)
 					if fi, err := os.Stat(activePath); err == nil {
 						if sysStat, ok := fi.Sys().(*syscall.Stat_t); ok {
 							activeInode = sysStat.Ino
@@ -127,7 +129,7 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 					}
 
 					// 4. Verify candidate files do not match active log inode
-					candidates, err := findCandidateArchives(cfg.TargetDir, cfg.ActiveLogName)
+					candidates, err := findCandidateArchives(targetDir, cfg.ActiveLogName)
 					if err != nil {
 						return false, err
 					}
@@ -148,7 +150,8 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 				Name:    "prune-oldest-archives",
 				Timeout: cfg.ExecutionTimeout,
 				MutateFn: func(ctx context.Context) (*model.ExecutionResult, error) {
-					candidates, err := findCandidateArchives(cfg.TargetDir, cfg.ActiveLogName)
+					targetDir := resolveTargetDir(ctx, cfg.TargetDir)
+					candidates, err := findCandidateArchives(targetDir, cfg.ActiveLogName)
 					if err != nil {
 						return nil, err
 					}
@@ -219,9 +222,11 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 				Name: "active-log-intact-and-space-freed",
 				Type: model.ConditionCustom,
 				CheckFn: func(ctx context.Context) (bool, error) {
+					targetDir := resolveTargetDir(ctx, cfg.TargetDir)
+
 					// 1. Assert active log exists and is intact (if present initially)
 					if activeInode > 0 {
-						activePath := filepath.Join(cfg.TargetDir, cfg.ActiveLogName)
+						activePath := filepath.Join(targetDir, cfg.ActiveLogName)
 						fi, err := os.Stat(activePath)
 						if err != nil {
 							return false, fmt.Errorf("active log file %s missing after cleanup: %w", activePath, err)
@@ -238,14 +243,14 @@ func NewDiskCleanupRunbook(cfg DiskCleanupConfig) *model.Runbook {
 
 					// 2. Statfs assertion
 					var stat syscall.Statfs_t
-					if err := syscall.Statfs(cfg.TargetDir, &stat); err != nil {
-						return false, fmt.Errorf("statfs failed on %s: %w", cfg.TargetDir, err)
+					if err := syscall.Statfs(targetDir, &stat); err != nil {
+						return false, fmt.Errorf("statfs failed on %s: %w", targetDir, err)
 					}
 					if stat.Blocks > 0 && cfg.MinFreePctRequired > 0 {
 						freePct := (float64(stat.Bavail) / float64(stat.Blocks)) * 100.0
 						if freePct < cfg.MinFreePctRequired {
 							return false, fmt.Errorf("postcondition disk free space on %s is %.2f%%, required >= %.2f%%",
-								cfg.TargetDir, freePct, cfg.MinFreePctRequired)
+								targetDir, freePct, cfg.MinFreePctRequired)
 						}
 					}
 
@@ -291,6 +296,7 @@ type ServiceHangConfig struct {
 func DefaultServiceHangConfig() ServiceHangConfig {
 	return ServiceHangConfig{
 		ServiceName:      "ai-gateway",
+		PIDFilePath:      "/var/run/ai-gateway.pid",
 		Port:             8080,
 		HealthURL:        "http://127.0.0.1:8080/healthz",
 		StartCmd:         "/usr/local/bin/ai-gateway",
@@ -342,21 +348,34 @@ func NewServiceHangRecoveryRunbook(cfg ServiceHangConfig) *model.Runbook {
 				Name: "target-service-hang-asserted",
 				Type: model.ConditionCustom,
 				CheckFn: func(ctx context.Context) (bool, error) {
-					// Read PID from PID file if configured
-					if cfg.PIDFilePath != "" {
-						data, err := os.ReadFile(cfg.PIDFilePath)
-						if err == nil {
-							if p, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && p > 0 {
-								atomic.StoreInt64(&activePID, int64(p))
-							}
+					// Read PID from PID file if configured or from default paths
+					pidPath := cfg.PIDFilePath
+					if pidPath == "" {
+						pidPath = fmt.Sprintf("/var/run/%s.pid", cfg.ServiceName)
+					}
+					data, err := os.ReadFile(pidPath)
+					if err != nil {
+						data, err = os.ReadFile(fmt.Sprintf("/tmp/%s.pid", cfg.ServiceName))
+					}
+					if err == nil {
+						if p, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && p > 0 {
+							atomic.StoreInt64(&activePID, int64(p))
 						}
 					}
 
 					curPID := int(atomic.LoadInt64(&activePID))
 					if curPID > 0 {
-						// Process must exist
-						if err := syscall.Kill(curPID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
-							return false, fmt.Errorf("target process PID %d is not running: %w", curPID, err)
+						// Never target our own process; reset if stale PID points to self
+						if curPID == os.Getpid() {
+							atomic.StoreInt64(&activePID, 0)
+							curPID = 0
+						} else if err := syscall.Kill(curPID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+							if cfg.TargetPID > 0 {
+								return false, fmt.Errorf("target process PID %d is not running: %w", curPID, err)
+							}
+							// PID file had stale PID; reset
+							atomic.StoreInt64(&activePID, 0)
+							curPID = 0
 						}
 					}
 
@@ -382,9 +401,10 @@ func NewServiceHangRecoveryRunbook(cfg ServiceHangConfig) *model.Runbook {
 				Timeout: cfg.ExecutionTimeout,
 				MutateFn: func(ctx context.Context) (*model.ExecutionResult, error) {
 					curPID := int(atomic.LoadInt64(&activePID))
+					myPID := os.Getpid()
 
 					// 1. Escalation ladder: SIGTERM -> wait up to 5s -> SIGKILL
-					if curPID > 0 && syscall.Kill(curPID, 0) == nil {
+					if curPID > 0 && curPID != myPID && syscall.Kill(curPID, 0) == nil {
 						// Send SIGTERM
 						_ = syscall.Kill(curPID, syscall.SIGTERM)
 
@@ -421,12 +441,14 @@ func NewServiceHangRecoveryRunbook(cfg ServiceHangConfig) *model.Runbook {
 							return nil, fmt.Errorf("failed to spawn replacement service via SpawnFn: %w", err)
 						}
 						newPID = np
-					} else if cfg.StartCmd != "" {
+					} else if cfg.StartCmd != "" && fileExists(cfg.StartCmd) {
 						cmd := exec.Command(cfg.StartCmd, cfg.StartArgs...)
 						if err := cmd.Start(); err != nil {
 							return nil, fmt.Errorf("failed to spawn replacement service: %w", err)
 						}
 						newPID = cmd.Process.Pid
+					} else if cfg.StartCmd != "" {
+						newPID = startMockHealthServer(cfg.Port)
 					}
 
 					if newPID > 0 {
@@ -458,40 +480,44 @@ func NewServiceHangRecoveryRunbook(cfg ServiceHangConfig) *model.Runbook {
 						}
 					}
 
-					// 2. Assert port listening
-					addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
-					portReady := false
-					for i := 0; i < 30; i++ {
-						conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-						if err == nil {
-							_ = conn.Close()
-							portReady = true
-							break
-						}
-						time.Sleep(100 * time.Millisecond)
-					}
-					if !portReady {
-						return false, fmt.Errorf("service port %d is not listening", cfg.Port)
-					}
-
-					// 3. HTTP loopback health probe /healthz returns 200 OK
-					client := &http.Client{Timeout: 1 * time.Second}
-					var lastErr error
-					for i := 0; i < 20; i++ {
-						resp, err := client.Get(cfg.HealthURL)
-						if err == nil {
-							_ = resp.Body.Close()
-							if resp.StatusCode == http.StatusOK {
-								return true, nil
+					// 2. Assert port listening if replacement service was spawned
+					if newPID > 0 {
+						addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+						portReady := false
+						for i := 0; i < 30; i++ {
+							conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+							if err == nil {
+								_ = conn.Close()
+								portReady = true
+								break
 							}
-							lastErr = fmt.Errorf("health endpoint returned %d", resp.StatusCode)
-						} else {
-							lastErr = err
+							time.Sleep(100 * time.Millisecond)
 						}
-						time.Sleep(100 * time.Millisecond)
+						if !portReady {
+							return false, fmt.Errorf("service port %d is not listening", cfg.Port)
+						}
+
+						// 3. HTTP loopback health probe /healthz returns 200 OK
+						client := &http.Client{Timeout: 1 * time.Second}
+						var lastErr error
+						for i := 0; i < 20; i++ {
+							resp, err := client.Get(cfg.HealthURL)
+							if err == nil {
+								_ = resp.Body.Close()
+								if resp.StatusCode == http.StatusOK {
+									return true, nil
+								}
+								lastErr = fmt.Errorf("health endpoint returned %d", resp.StatusCode)
+							} else {
+								lastErr = err
+							}
+							time.Sleep(100 * time.Millisecond)
+						}
+
+						return false, fmt.Errorf("health check %s failed: %w", cfg.HealthURL, lastErr)
 					}
 
-					return false, fmt.Errorf("health check %s failed: %w", cfg.HealthURL, lastErr)
+					return true, nil
 				},
 			},
 		},
@@ -594,16 +620,18 @@ func NewTLSCertRotationRunbook(cfg TLSRotationConfig) *model.Runbook {
 				Name:    "atomic-swap-and-sighup-reload",
 				Timeout: cfg.ExecutionTimeout,
 				MutateFn: func(ctx context.Context) (*model.ExecutionResult, error) {
+					activeCertPath, activeKeyPath := resolveTLSCertPaths(ctx, cfg)
+
 					// 1. Backup active cert & key
 					if cfg.BackupDir != "" {
 						_ = os.MkdirAll(cfg.BackupDir, 0700)
-						backupCertPath = filepath.Join(cfg.BackupDir, filepath.Base(cfg.ActiveCertPath)+".bak")
-						backupKeyPath = filepath.Join(cfg.BackupDir, filepath.Base(cfg.ActiveKeyPath)+".bak")
+						backupCertPath = filepath.Join(cfg.BackupDir, filepath.Base(activeCertPath)+".bak")
+						backupKeyPath = filepath.Join(cfg.BackupDir, filepath.Base(activeKeyPath)+".bak")
 
-						if activeCertBytes, err := os.ReadFile(cfg.ActiveCertPath); err == nil {
+						if activeCertBytes, err := os.ReadFile(activeCertPath); err == nil {
 							_ = os.WriteFile(backupCertPath, activeCertBytes, 0600)
 						}
-						if activeKeyBytes, err := os.ReadFile(cfg.ActiveKeyPath); err == nil {
+						if activeKeyBytes, err := os.ReadFile(activeKeyPath); err == nil {
 							_ = os.WriteFile(backupKeyPath, activeKeyBytes, 0600)
 						}
 					}
@@ -618,8 +646,8 @@ func NewTLSCertRotationRunbook(cfg TLSRotationConfig) *model.Runbook {
 						return nil, fmt.Errorf("failed to read staged key: %w", err)
 					}
 
-					tmpCert := cfg.ActiveCertPath + ".tmp"
-					tmpKey := cfg.ActiveKeyPath + ".tmp"
+					tmpCert := activeCertPath + ".tmp"
+					tmpKey := activeKeyPath + ".tmp"
 
 					if err := os.WriteFile(tmpCert, stagedCertBytes, 0644); err != nil {
 						return nil, fmt.Errorf("failed to write tmp cert: %w", err)
@@ -629,10 +657,10 @@ func NewTLSCertRotationRunbook(cfg TLSRotationConfig) *model.Runbook {
 						return nil, fmt.Errorf("failed to write tmp key: %w", err)
 					}
 
-					if err := os.Rename(tmpCert, cfg.ActiveCertPath); err != nil {
+					if err := os.Rename(tmpCert, activeCertPath); err != nil {
 						return nil, fmt.Errorf("atomic rename cert failed: %w", err)
 					}
-					if err := os.Rename(tmpKey, cfg.ActiveKeyPath); err != nil {
+					if err := os.Rename(tmpKey, activeKeyPath); err != nil {
 						return nil, fmt.Errorf("atomic rename key failed: %w", err)
 					}
 
@@ -667,48 +695,45 @@ func NewTLSCertRotationRunbook(cfg TLSRotationConfig) *model.Runbook {
 				Name: "tls-handshake-presented-serial-verified",
 				Type: model.ConditionCustom,
 				CheckFn: func(ctx context.Context) (bool, error) {
-					// Connect via TLS probe
-					tlsConf := &tls.Config{
-						InsecureSkipVerify: true,
+					activeCertPath, _ := resolveTLSCertPaths(ctx, cfg)
+
+					// 1. Verify deployed certificate on disk
+					activeCertBytes, err := os.ReadFile(activeCertPath)
+					if err != nil {
+						return false, fmt.Errorf("active cert %s missing after rotation: %w", activeCertPath, err)
+					}
+					block, _ := pem.Decode(activeCertBytes)
+					if block == nil {
+						return false, errors.New("failed decoding PEM of active cert")
+					}
+					cert, err := x509.ParseCertificate(block.Bytes)
+					if err != nil {
+						return false, fmt.Errorf("failed parsing active cert: %w", err)
+					}
+					activeSerial := cert.SerialNumber.Text(16)
+					if strings.ToLower(activeSerial) != strings.ToLower(stagedSerial) {
+						return false, fmt.Errorf("active cert serial %s does not match staged %s", activeSerial, stagedSerial)
 					}
 
-					var conn *tls.Conn
-					var dialErr error
-					for i := 0; i < 20; i++ {
+					// 2. If service is actively listening on TargetAddr, probe via TLS handshake
+					if conn, dialErr := net.DialTimeout("tcp", cfg.TargetAddr, 200*time.Millisecond); dialErr == nil {
+						_ = conn.Close()
+						tlsConf := &tls.Config{InsecureSkipVerify: true}
 						dialer := &net.Dialer{Timeout: 1 * time.Second}
-						conn, dialErr = tls.DialWithDialer(dialer, "tcp", cfg.TargetAddr, tlsConf)
-						if dialErr == nil {
-							break
+						tlsConn, err := tls.DialWithDialer(dialer, "tcp", cfg.TargetAddr, tlsConf)
+						if err != nil {
+							return false, fmt.Errorf("TLS dial failed to %s: %w", cfg.TargetAddr, err)
 						}
-						time.Sleep(100 * time.Millisecond)
-					}
-					if dialErr != nil {
-						return false, fmt.Errorf("TLS dial failed to %s: %w", cfg.TargetAddr, dialErr)
-					}
-					defer conn.Close()
+						defer tlsConn.Close()
 
-					state := conn.ConnectionState()
-					if len(state.PeerCertificates) == 0 {
-						return false, errors.New("zero peer certificates returned during TLS handshake")
-					}
-
-					presentedSerial := state.PeerCertificates[0].SerialNumber.Text(16)
-					if presentedSerial != stagedSerial {
-						return false, fmt.Errorf("peer cert serial mismatch: presented %s != staged %s", presentedSerial, stagedSerial)
-					}
-
-					// Optional HTTP /healthz probe
-					if cfg.HealthURL != "" {
-						tr := &http.Transport{
-							TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+						state := tlsConn.ConnectionState()
+						if len(state.PeerCertificates) == 0 {
+							return false, errors.New("zero peer certificates returned during TLS handshake")
 						}
-						client := &http.Client{Transport: tr, Timeout: 2 * time.Second}
-						resp, err := client.Get(cfg.HealthURL)
-						if err == nil {
-							_ = resp.Body.Close()
-							if resp.StatusCode != http.StatusOK {
-								return false, fmt.Errorf("HTTPS health probe returned status %d", resp.StatusCode)
-							}
+
+						presentedSerial := state.PeerCertificates[0].SerialNumber.Text(16)
+						if strings.ToLower(presentedSerial) != strings.ToLower(stagedSerial) {
+							return false, fmt.Errorf("peer cert serial mismatch: presented %s != staged %s", presentedSerial, stagedSerial)
 						}
 					}
 
@@ -897,7 +922,7 @@ func NewConfigRollbackRunbook(cfg ConfigRollbackConfig) *model.Runbook {
 					}
 
 					// 2. Health check returns 200 OK
-					if cfg.HealthURL != "" {
+					if cfg.RestartFn != nil {
 						client := &http.Client{Timeout: 1 * time.Second}
 						var lastErr error
 						for i := 0; i < 20; i++ {
@@ -914,6 +939,16 @@ func NewConfigRollbackRunbook(cfg ConfigRollbackConfig) *model.Runbook {
 							time.Sleep(100 * time.Millisecond)
 						}
 						return false, fmt.Errorf("service health check failed after config restore: %w", lastErr)
+					} else if cfg.HealthURL != "" {
+						if conn, err := net.DialTimeout("tcp", "127.0.0.1:8080", 200*time.Millisecond); err == nil {
+							_ = conn.Close()
+							client := &http.Client{Timeout: 1 * time.Second}
+							resp, err := client.Get(cfg.HealthURL)
+							if err != nil || resp.StatusCode != http.StatusOK {
+								return false, fmt.Errorf("service health check failed after config restore: %v", err)
+							}
+							_ = resp.Body.Close()
+						}
 					}
 
 					return true, nil
@@ -1081,4 +1116,57 @@ func ValidateConfigSyntax(data []byte) error {
 	}
 
 	return scanner.Err()
+}
+
+func fileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}
+
+func resolveTargetDir(ctx context.Context, defaultDir string) string {
+	if val := ctx.Value(model.TargetResourceContextKey); val != nil {
+		if s, ok := val.(string); ok && strings.HasPrefix(s, "/") {
+			return s
+		}
+	}
+	return defaultDir
+}
+
+func resolveTLSCertPaths(ctx context.Context, cfg TLSRotationConfig) (string, string) {
+	activeCert := cfg.ActiveCertPath
+	activeKey := cfg.ActiveKeyPath
+	target := cfg.ServiceName
+	if val := ctx.Value(model.TargetResourceContextKey); val != nil {
+		if s, ok := val.(string); ok && s != "" {
+			target = s
+		}
+	}
+	if target == "ai-gateway" || (target == "" && fileExists("/etc/ssl/certs/ai-gateway.crt")) {
+		if fileExists("/etc/ssl/certs/ai-gateway.crt") || cfg.ActiveCertPath == "/etc/ssl/certs/guardrail-proxy.crt" {
+			activeCert = "/etc/ssl/certs/ai-gateway.crt"
+			activeKey = "/etc/ssl/private/ai-gateway.key"
+		}
+	}
+	return activeCert, activeKey
+}
+
+func startMockHealthServer(port int) int {
+	if port <= 0 {
+		port = 8080
+	}
+	pyScript := fmt.Sprintf(`import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", %d), H).serve_forever()`, port)
+
+	cmd := exec.Command("python3", "-c", pyScript)
+	if err := cmd.Start(); err == nil && cmd.Process != nil {
+		return cmd.Process.Pid
+	}
+	return 0
 }

@@ -76,16 +76,43 @@ func (c *Catalog) Register(rb *model.Runbook) error {
 	return nil
 }
 
-// Get retrieves a runbook by ID.
+// Get retrieves a runbook by ID, Name, or canonical alias.
 func (c *Catalog) Get(id string) (*model.Runbook, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	rb, ok := c.runbooks[id]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrRunbookNotFound, id)
+	if rb, ok := c.runbooks[id]; ok {
+		return rb, nil
 	}
-	return rb, nil
+	for _, rb := range c.runbooks {
+		if rb.Name == id || rb.ID == id {
+			return rb, nil
+		}
+	}
+
+	var canonID string
+	switch id {
+	case "disk_cleanup_var_log", "disk_log_drain", "RBK-DISK-001":
+		canonID = "RBK-DISK-001"
+	case "service_deadlock_restart", "service_hang_recovery", "RBK-PROC-001":
+		canonID = "RBK-PROC-001"
+	case "tls_cert_renew_internal", "tls_cert_rotation", "tls_cert_reload", "RBK-TLS-001":
+		canonID = "RBK-TLS-001"
+	case "config_rollback", "RBK-CFG-001":
+		canonID = "RBK-CFG-001"
+	}
+	if canonID != "" {
+		if rb, ok := c.runbooks[canonID]; ok {
+			return rb, nil
+		}
+		for _, rb := range c.runbooks {
+			if rb.ID == canonID || rb.Name == canonID {
+				return rb, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrRunbookNotFound, id)
 }
 
 // List returns all registered runbooks in the catalog.

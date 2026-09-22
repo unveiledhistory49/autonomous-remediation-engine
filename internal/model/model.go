@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// ContextKey represents context key types used across engine execution.
+type ContextKey string
+
+const (
+	// TargetResourceContextKey carries the runtime target resource ID in context.
+	TargetResourceContextKey ContextKey = "remediation_target_resource"
+)
+
 // Severity represents the alert severity level.
 type Severity string
 

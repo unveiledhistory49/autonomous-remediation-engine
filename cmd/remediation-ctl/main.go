@@ -59,25 +59,36 @@ func printUsage() {
 
 func handleRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	runbookID := fs.String("runbook", "", "Runbook identifier (e.g. RBK-DISK-001)")
+	runbookID := fs.String("runbook", "", "Runbook identifier (e.g. RBK-DISK-001 or disk_cleanup_var_log)")
 	resourceID := fs.String("resource", "", "Target resource path or service name (e.g. /var/log)")
+	targetID := fs.String("target", "", "Target resource path or service name (alias for --resource)")
 	auditLog := fs.String("audit-log", "/tmp/remediation-audit.log", "Path to audit ledger log file")
 	lockDir := fs.String("lock-dir", "/tmp/remediation-locks", "Directory for lock coordination")
 	journalDir := fs.String("journal-dir", "/tmp/remediation-journal", "Directory for WAL journal")
 	dampingFile := fs.String("damping-file", "/tmp/remediation-damping.json", "Path to damping state file")
 	_ = fs.Parse(args)
 
-	if *runbookID == "" || *resourceID == "" {
-		fmt.Fprintln(os.Stderr, "Error: --runbook and --resource flags are required for 'run'")
+	effectiveTarget := *resourceID
+	if effectiveTarget == "" {
+		effectiveTarget = *targetID
+	}
+
+	if *runbookID == "" || effectiveTarget == "" {
+		fmt.Fprintln(os.Stderr, "Error: --runbook and --target (or --resource) flags are required for 'run'")
 		fs.Usage()
 		os.Exit(1)
+	}
+
+	dampFile := *dampingFile
+	if envDamp := os.Getenv("REMEDIATION_DAMPING_FILE"); envDamp != "" && dampFile == "/tmp/remediation-damping.json" {
+		dampFile = envDamp
 	}
 
 	cfg := engine.EngineConfig{
 		LockDir:          *lockDir,
 		AuditLogPath:     *auditLog,
 		JournalDir:       *journalDir,
-		DampingStatePath: *dampingFile,
+		DampingStatePath: dampFile,
 		HostUUID:         "remediation-ctl-node",
 	}
 
@@ -93,8 +104,8 @@ func handleRun(args []string) {
 	}
 
 	ctx := context.Background()
-	fmt.Printf("==> Starting remediation for Runbook [%s] on Resource [%s]...\n", *runbookID, *resourceID)
-	result, err := eng.RunDirect(ctx, *runbookID, *resourceID)
+	fmt.Printf("==> Starting remediation for Runbook [%s] on Resource [%s]...\n", *runbookID, effectiveTarget)
+	result, err := eng.RunDirect(ctx, *runbookID, effectiveTarget)
 
 	fmt.Println("\n--- Execution Telemetry ---")
 	if result != nil {

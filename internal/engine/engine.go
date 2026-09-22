@@ -170,16 +170,44 @@ func (e *Engine) RegisterRunbook(rb *model.Runbook) error {
 	return nil
 }
 
-// GetRunbook retrieves a runbook from the engine catalog.
+// GetRunbook retrieves a runbook from the engine catalog by ID, Name, or canonical alias.
 func (e *Engine) GetRunbook(id string) (*model.Runbook, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	rb, ok := e.runbooks[id]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrRunbookNotFound, id)
+	if rb, ok := e.runbooks[id]; ok {
+		return rb, nil
 	}
-	return rb, nil
+	for _, rb := range e.runbooks {
+		if rb.Name == id || rb.ID == id {
+			return rb, nil
+		}
+	}
+
+	// Standard alias mapping
+	var canonID string
+	switch id {
+	case "disk_cleanup_var_log", "disk_log_drain", "RBK-DISK-001":
+		canonID = "RBK-DISK-001"
+	case "service_deadlock_restart", "service_hang_recovery", "RBK-PROC-001":
+		canonID = "RBK-PROC-001"
+	case "tls_cert_renew_internal", "tls_cert_rotation", "tls_cert_reload", "RBK-TLS-001":
+		canonID = "RBK-TLS-001"
+	case "config_rollback", "RBK-CFG-001":
+		canonID = "RBK-CFG-001"
+	}
+	if canonID != "" {
+		if rb, ok := e.runbooks[canonID]; ok {
+			return rb, nil
+		}
+		for _, rb := range e.runbooks {
+			if rb.ID == canonID || rb.Name == canonID {
+				return rb, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrRunbookNotFound, id)
 }
 
 // ListRunbooks returns all registered runbooks in the engine.
@@ -230,6 +258,10 @@ func (e *Engine) RunDirect(ctx context.Context, runbookID, resourceID string) (*
 // Remediate executes the complete 11-state closed-loop remediation control loop.
 func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*RemediationResult, error) {
 	start := time.Now()
+
+	if alert != nil && alert.ResourceID != "" {
+		ctx = context.WithValue(ctx, model.TargetResourceContextKey, alert.ResourceID)
+	}
 
 	// 1. Initialize FSM: DETECTED
 	fsm, err := model.NewFSM(model.StateDetected)

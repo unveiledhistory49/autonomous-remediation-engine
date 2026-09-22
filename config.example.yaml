@@ -1,0 +1,51 @@
+# Autonomous Remediation Engine - Production Configuration
+# Schema compliant with internal/config/config.go and docs/OPERATIONS.md
+# Zero external dependencies. All mutations guarded by deterministic state machine.
+
+# --- IPC & Ingress Endpoints ---
+# Local Unix domain socket for CLI operations and low-latency local IPC
+unix_socket_path: "/run/remediation.sock"
+
+# HTTP server address for Alertmanager webhooks, Prometheus metrics (/metrics), and healthz (/healthz)
+http_addr: "127.0.0.1:9443"
+
+# Shared secret for HMAC-SHA256 signature verification on incoming webhook alerts (X-Signature-256 header)
+# Leave blank to disable HMAC verification (development/testing only; MUST be configured in production)
+hmac_secret: "prod-remediation-hmac-secret-64bytes-deterministic-key-replace-me"
+
+# --- Persistence, Coordination & Audit Storage ---
+# Path to cryptographic append-only WAL ledger recording all transitions, mutations, and hashes
+audit_log_path: "/var/lib/autonomous-remediation/audit/audit.wal"
+
+# Directory for non-blocking kernel advisory file locks (flock/fcntl) guaranteeing single-operator safety
+lock_dir: "/var/run/remediation/"
+
+# Directory for two-phase Write-Ahead Log (WAL) rollback transaction journals
+journal_dir: "/var/lib/autonomous-remediation/journal/"
+
+# Path to persistent JSON state tracking sliding window execution history and flap damping
+damping_state_file: "/var/lib/autonomous-remediation/damping.json"
+
+# Unique identifier for this host node recorded in the cryptographic audit ledger
+host_uuid: "node-arm64-prod-01"
+
+# --- Autonomous Poller Supervision ---
+# Background polling frequency for proactive anomaly detection (Go duration string: e.g., 2s, 500ms)
+poll_interval: "2s"
+
+# List of critical local microservices monitored for liveliness, port binding, and health status
+monitored_services:
+  - name: "ai-gateway"
+    health_url: "http://127.0.0.1:8080/healthz"
+    pid_file: "/var/run/ai-gateway.pid"
+    port: 8080
+
+  - name: "guardrail-proxy"
+    health_url: "http://127.0.0.1:8081/healthz"
+    pid_file: "/var/run/guardrail-proxy.pid"
+    port: 8081
+
+# List of filesystem volume mount points monitored for disk exhaustion
+monitored_paths:
+  - path: "/var/log"
+    min_free_pct: 15.0
