@@ -8,82 +8,15 @@ import (
 	"time"
 
 	"autonomous-remediation-engine/internal/audit"
+	"autonomous-remediation-engine/internal/damping"
 	"autonomous-remediation-engine/internal/engine"
 	"autonomous-remediation-engine/internal/model"
 	"autonomous-remediation-engine/internal/rollback"
+	"autonomous-remediation-engine/internal/runbooks"
 )
 
 func defaultCatalog() []*model.Runbook {
-	return []*model.Runbook{
-		{
-			ID:               "RBK-DISK-001",
-			Version:          "1.0.0",
-			Name:             "disk_cleanup_var_log",
-			TargetResourceID: "/var/log",
-			Severity:         model.SeverityHigh,
-			Preconditions: []model.Precondition{
-				{
-					Name:       "disk-usage-threshold",
-					Type:       model.ConditionDiskFree,
-					Target:     "/var/log",
-					MinFreePct: 0.0, // verified via statfs
-				},
-			},
-			Actions: []model.Action{
-				{
-					Name:    "prune-rotated-logs",
-					Binary:  "/bin/echo",
-					Args:    []string{"[RBK-DISK-001] safe log drain executed"},
-					Timeout: 10 * time.Second,
-				},
-			},
-			Postconditions: []model.Postcondition{
-				{
-					Name:       "disk-capacity-restored",
-					Type:       model.ConditionDiskFree,
-					Target:     "/var/log",
-					MinFreePct: 0.0,
-				},
-			},
-			BlastRadius: model.BlastRadius{
-				MaxExecutionTime: 15 * time.Second,
-				MaxBytesMutated:  524288000, // 500 MB
-			},
-		},
-		{
-			ID:               "RBK-PROC-001",
-			Version:          "1.0.0",
-			Name:             "service_hang_recovery",
-			TargetResourceID: "ai-gateway",
-			Severity:         model.SeverityCritical,
-			Preconditions: []model.Precondition{
-				{
-					Name:   "root-filesystem-check",
-					Type:   model.ConditionFileExists,
-					Target: "/proc",
-				},
-			},
-			Actions: []model.Action{
-				{
-					Name:    "restart-service-action",
-					Binary:  "/bin/echo",
-					Args:    []string{"[RBK-PROC-001] supervised service reload triggered"},
-					Timeout: 15 * time.Second,
-				},
-			},
-			Postconditions: []model.Postcondition{
-				{
-					Name:   "system-procfs-alive",
-					Type:   model.ConditionFileExists,
-					Target: "/proc/stat",
-				},
-			},
-			BlastRadius: model.BlastRadius{
-				MaxExecutionTime:     15 * time.Second,
-				MaxProcessesSignaled: 1,
-			},
-		},
-	}
+	return runbooks.DefaultCatalog()
 }
 
 func main() {
@@ -100,6 +33,10 @@ func main() {
 		handleVerifyAudit(os.Args[2:])
 	case "status":
 		handleStatus(os.Args[2:])
+	case "list-runbooks":
+		handleListRunbooks(os.Args[2:])
+	case "damping-status":
+		handleDampingStatus(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -113,9 +50,11 @@ func printUsage() {
 	fmt.Println("Autonomous Remediation Engine Controller (remediation-ctl)")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  remediation-ctl run --runbook=<id> --resource=<res> [--audit-log=<path>] [--lock-dir=<dir>] [--journal-dir=<dir>]")
+	fmt.Println("  remediation-ctl run --runbook=<id> --resource=<res> [--audit-log=<path>] [--lock-dir=<dir>] [--journal-dir=<dir>] [--damping-file=<path>]")
 	fmt.Println("  remediation-ctl verify-audit --file=<path>")
 	fmt.Println("  remediation-ctl status [--journal-dir=<dir>]")
+	fmt.Println("  remediation-ctl list-runbooks")
+	fmt.Println("  remediation-ctl damping-status [--damping-file=<path>] [--resource=<res>]")
 }
 
 func handleRun(args []string) {
@@ -125,6 +64,7 @@ func handleRun(args []string) {
 	auditLog := fs.String("audit-log", "/tmp/remediation-audit.log", "Path to audit ledger log file")
 	lockDir := fs.String("lock-dir", "/tmp/remediation-locks", "Directory for lock coordination")
 	journalDir := fs.String("journal-dir", "/tmp/remediation-journal", "Directory for WAL journal")
+	dampingFile := fs.String("damping-file", "/tmp/remediation-damping.json", "Path to damping state file")
 	_ = fs.Parse(args)
 
 	if *runbookID == "" || *resourceID == "" {
@@ -134,10 +74,11 @@ func handleRun(args []string) {
 	}
 
 	cfg := engine.EngineConfig{
-		LockDir:      *lockDir,
-		AuditLogPath: *auditLog,
-		JournalDir:   *journalDir,
-		HostUUID:     "remediation-ctl-node",
+		LockDir:          *lockDir,
+		AuditLogPath:     *auditLog,
+		JournalDir:       *journalDir,
+		DampingStatePath: *dampingFile,
+		HostUUID:         "remediation-ctl-node",
 	}
 
 	eng, err := engine.NewEngine(cfg)
@@ -235,5 +176,105 @@ func handleStatus(args []string) {
 			rb.ID, rb.Name, rb.TargetResourceID, rb.Severity)
 	}
 
+	fmt.Println("==================================================================")
+}
+
+func handleListRunbooks(args []string) {
+	catalog := defaultCatalog()
+	fmt.Println("==================================================================")
+	fmt.Println("  AVAILABLE PRODUCTION RUNBOOKS                                   ")
+	fmt.Println("==================================================================")
+	fmt.Printf("Total Runbooks: %d registered\n\n", len(catalog))
+	for i, rb := range catalog {
+		fmt.Printf("[%d] ID: %s\n", i+1, rb.ID)
+		fmt.Printf("    Name             : %s\n", rb.Name)
+		fmt.Printf("    Target Resource  : %s\n", rb.TargetResourceID)
+		fmt.Printf("    Severity         : %s\n", rb.Severity)
+		fmt.Printf("    Max Execution    : %v\n", rb.BlastRadius.MaxExecutionTime)
+		if rb.BlastRadius.MaxBytesMutated > 0 {
+			fmt.Printf("    Max Bytes Mutated: %d bytes\n", rb.BlastRadius.MaxBytesMutated)
+		}
+		if rb.BlastRadius.MaxFilesModified > 0 {
+			fmt.Printf("    Max Files Mod    : %d files\n", rb.BlastRadius.MaxFilesModified)
+		}
+		fmt.Printf("    Preconditions    : %d checks\n", len(rb.Preconditions))
+		for _, p := range rb.Preconditions {
+			fmt.Printf("      - %s (%s)\n", p.Name, p.Type)
+		}
+		fmt.Printf("    Actions          : %d steps\n", len(rb.Actions))
+		for _, a := range rb.Actions {
+			fmt.Printf("      - %s\n", a.Name)
+		}
+		fmt.Printf("    Postconditions   : %d checks\n", len(rb.Postconditions))
+		for _, post := range rb.Postconditions {
+			fmt.Printf("      - %s (%s)\n", post.Name, post.Type)
+		}
+		fmt.Println("------------------------------------------------------------------")
+	}
+}
+
+func handleDampingStatus(args []string) {
+	fs := flag.NewFlagSet("damping-status", flag.ExitOnError)
+	dampingFile := fs.String("damping-file", "/tmp/remediation-damping.json", "Path to damping state file")
+	resource := fs.String("resource", "", "Target resource (optional, checks specific resource)")
+	_ = fs.Parse(args)
+
+	fmt.Println("==================================================================")
+	fmt.Println("  FLAPPING DAMPING & CIRCUIT BREAKER STATUS                       ")
+	fmt.Println("==================================================================")
+	fmt.Printf("Damping State File: %s\n", *dampingFile)
+
+	ctrl, err := damping.NewController(*dampingFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading damping controller: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *resource != "" {
+		canExec, reason := ctrl.CanExecute(*resource)
+		st := ctrl.GetStatus(*resource)
+		fmt.Printf("\nResource: %s\n", *resource)
+		fmt.Printf("  Executable Now : %v\n", canExec)
+		if !canExec {
+			fmt.Printf("  Block Reason   : %s\n", reason)
+		}
+		if st != nil {
+			fmt.Printf("  Tripped        : %v\n", st.Tripped)
+			if st.Tripped {
+				fmt.Printf("  Quarantine Thru: %s\n", st.QuarantineUntil.UTC().Format(time.RFC3339))
+				fmt.Printf("  Trip Reason    : %s\n", st.TripReason)
+			}
+			fmt.Printf("  Executions (%d) :\n", len(st.Executions))
+			for _, t := range st.Executions {
+				fmt.Printf("    - %s (%v ago)\n", t.UTC().Format(time.RFC3339), time.Since(t).Round(time.Second))
+			}
+		} else {
+			fmt.Println("  No execution history recorded for this resource.")
+		}
+	} else {
+		statuses := ctrl.GetAllStatuses()
+		if len(statuses) == 0 {
+			fmt.Println("\nNo resource flapping records tracked (all circuits nominal).")
+		} else {
+			fmt.Printf("\nTracked Resources: %d\n", len(statuses))
+			for resName, st := range statuses {
+				canExec, reason := ctrl.CanExecute(resName)
+				fmt.Printf("\n* Resource: %s\n", resName)
+				fmt.Printf("  Executable Now : %v\n", canExec)
+				if !canExec {
+					fmt.Printf("  Block Reason   : %s\n", reason)
+				}
+				fmt.Printf("  Tripped        : %v\n", st.Tripped)
+				if st.Tripped {
+					fmt.Printf("  Quarantine Thru: %s\n", st.QuarantineUntil.UTC().Format(time.RFC3339))
+					fmt.Printf("  Trip Reason    : %s\n", st.TripReason)
+				}
+				fmt.Printf("  Executions (%d) :\n", len(st.Executions))
+				for _, t := range st.Executions {
+					fmt.Printf("    - %s (%v ago)\n", t.UTC().Format(time.RFC3339), time.Since(t).Round(time.Second))
+				}
+			}
+		}
+	}
 	fmt.Println("==================================================================")
 }

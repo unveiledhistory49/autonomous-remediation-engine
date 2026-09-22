@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"autonomous-remediation-engine/internal/audit"
+	"autonomous-remediation-engine/internal/damping"
 	"autonomous-remediation-engine/internal/executor"
 	"autonomous-remediation-engine/internal/lock"
 	"autonomous-remediation-engine/internal/model"
@@ -26,10 +27,11 @@ var (
 
 // EngineConfig provides configuration options for the Autonomous Remediation Engine.
 type EngineConfig struct {
-	LockDir      string
-	AuditLogPath string
-	JournalDir   string
-	HostUUID     string
+	LockDir          string
+	AuditLogPath     string
+	JournalDir       string
+	HostUUID         string
+	DampingStatePath string
 }
 
 // RemediationResult encapsulates the outcome and telemetry of an end-to-end remediation run.
@@ -55,6 +57,7 @@ type Engine struct {
 	journal        *rollback.Journal
 	rollbackEngine *rollback.RollbackEngine
 	executor       *executor.Executor
+	damping        *damping.Controller
 }
 
 // NewEngine constructs and initializes all subsystems of the remediation engine.
@@ -74,6 +77,11 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		return nil, fmt.Errorf("failed to initialize WAL journal: %w", err)
 	}
 
+	dampingCtrl, err := damping.NewController(cfg.DampingStatePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize damping controller: %w", err)
+	}
+
 	rbEngine := rollback.NewRollbackEngine(journal)
 	exec := executor.NewExecutor()
 
@@ -84,7 +92,13 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		journal:        journal,
 		rollbackEngine: rbEngine,
 		executor:       exec,
+		damping:        dampingCtrl,
 	}, nil
+}
+
+// Damping returns the engine's flapping damping controller.
+func (e *Engine) Damping() *damping.Controller {
+	return e.damping
 }
 
 // RegisterRunbook adds or updates a declarative runbook in the engine catalog.
@@ -235,7 +249,32 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 	}
 	defer resLock.Unlock()
 
-	// 4. Assert Deterministic Preconditions
+	// 4. Evaluate Flap Damping Gate
+	targetResource := matchedRunbook.TargetResource()
+	if targetResource == "" {
+		targetResource = alert.ResourceID
+	}
+
+	canExec, dampReason := e.damping.CanExecute(targetResource)
+	if !canExec {
+		failReason := fmt.Sprintf("FLAP_DAMPING_BREACH: %s", dampReason)
+		_ = fsm.Transition(model.StatePrecheckFailed, failReason)
+		_, _ = e.ledger.Append(alert.ResourceID, matchedRunbook.ID, model.StatePrecheckFailed, baseDigest)
+
+		_ = fsm.Transition(model.StateEscalated, "flap damping breach; fail-closed")
+		_, _ = e.ledger.Append(alert.ResourceID, matchedRunbook.ID, model.StateEscalated, baseDigest)
+
+		return &RemediationResult{
+			RunbookID:   matchedRunbook.ID,
+			ResourceID:  alert.ResourceID,
+			FinalState:  model.StatePrecheckFailed,
+			Duration:    time.Since(start),
+			Transitions: fsm.History(),
+			Error:       failReason,
+		}, fmt.Errorf("%w: %s", ErrPreconditionFail, failReason)
+	}
+
+	// 5. Assert Deterministic Preconditions
 	for _, pre := range matchedRunbook.Preconditions {
 		ok, preErr := verifier.VerifyPrecondition(ctx, pre)
 		if !ok || preErr != nil {
@@ -260,7 +299,7 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 	_ = fsm.Transition(model.StatePrecheckPassed, "all preconditions verified")
 	_, _ = e.ledger.Append(alert.ResourceID, matchedRunbook.ID, model.StatePrecheckPassed, baseDigest)
 
-	// 5. Stage Compensating Actions to WAL before any mutation occurs
+	// 6. Stage Compensating Actions to WAL before any mutation occurs
 	txID := fmt.Sprintf("%s-%s-%d", matchedRunbook.ID, alert.ID, time.Now().UnixNano())
 	walRec, err := e.journal.Stage(txID, matchedRunbook.ID, alert.ResourceID, matchedRunbook.RollbackSteps)
 	if err != nil {
@@ -279,7 +318,7 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 		}, err
 	}
 
-	// 6. Transition to EXECUTING and dispatch mutations
+	// 7. Transition to EXECUTING and dispatch mutations
 	_ = fsm.Transition(model.StateExecuting, "executing mutation actions")
 	_, _ = e.ledger.Append(alert.ResourceID, matchedRunbook.ID, model.StateExecuting, baseDigest)
 
@@ -301,7 +340,7 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 		}
 	}
 
-	// 7. Verify Postconditions if action execution completed
+	// 8. Verify Postconditions if action execution completed
 	var postconditionFailed bool
 	if !actionFailed {
 		for _, post := range matchedRunbook.Postconditions {
@@ -314,7 +353,7 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 		}
 	}
 
-	// 8. Outcome Branching:
+	// 9. Outcome Branching:
 	var stdout, stderr string
 	if lastExecRes != nil {
 		stdout = lastExecRes.Stdout
@@ -330,6 +369,9 @@ func (e *Engine) Remediate(ctx context.Context, alert *model.Alert) (*Remediatio
 		_ = fsm.Transition(model.StateCommitted, "remediation successfully verified and committed")
 		_ = e.journal.UpdateState(txID, rollback.StateCommitted)
 		_, _ = e.ledger.Append(alert.ResourceID, matchedRunbook.ID, model.StateCommitted, execDigest)
+
+		// Record successful execution for rate damping
+		e.damping.RecordExecution(targetResource)
 
 		return &RemediationResult{
 			TxID:         txID,

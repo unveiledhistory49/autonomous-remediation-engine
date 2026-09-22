@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -407,5 +408,112 @@ func TestEngine_MutualExclusionLock(t *testing.T) {
 	}
 	if res2.FinalState != model.StateEscalated {
 		t.Fatalf("expected worker 2 final state ESCALATED, got %s", res2.FinalState)
+	}
+}
+
+func TestEngine_FlapDampingIntegration(t *testing.T) {
+	eng, auditPath, cleanup := setupTestEngine(t)
+	defer cleanup()
+
+	baseTime := time.Date(2026, 9, 22, 14, 0, 0, 0, time.UTC)
+	currentTime := baseTime
+	eng.Damping().SetNowFunc(func() time.Time { return currentTime })
+
+	var execCount int
+	rb := &model.Runbook{
+		ID:               "RBK-DAMP-001",
+		TargetResourceID: "target-service-damping",
+		Severity:         model.SeverityHigh,
+		Preconditions: []model.Precondition{
+			{
+				Name: "pre-always-true",
+				Type: model.ConditionCustom,
+				CheckFn: func(ctx context.Context) (bool, error) {
+					return true, nil
+				},
+			},
+		},
+		Actions: []model.Action{
+			{
+				Name: "damped-action",
+				MutateFn: func(ctx context.Context) (*model.ExecutionResult, error) {
+					execCount++
+					return &model.ExecutionResult{Success: true}, nil
+				},
+			},
+		},
+		Postconditions: []model.Postcondition{
+			{
+				Name: "post-always-true",
+				Type: model.ConditionCustom,
+				CheckFn: func(ctx context.Context) (bool, error) {
+					return true, nil
+				},
+			},
+		},
+		BlastRadius: model.BlastRadius{
+			MaxExecutionTime: 5 * time.Second,
+		},
+	}
+
+	if err := eng.RegisterRunbook(rb); err != nil {
+		t.Fatalf("failed to register runbook: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. First execution should succeed and record execution
+	res1, err := eng.RunDirect(ctx, "RBK-DAMP-001", "target-service-damping")
+	if err != nil {
+		t.Fatalf("first execution should succeed, got: %v", err)
+	}
+	if !res1.Success || res1.FinalState != model.StateCommitted {
+		t.Fatalf("expected COMMITTED, got %s", res1.FinalState)
+	}
+	if execCount != 1 {
+		t.Fatalf("expected execCount == 1, got %d", execCount)
+	}
+
+	// 2. Second execution 10 seconds later (cooldown violation: elapsed 10s < 300s)
+	currentTime = baseTime.Add(10 * time.Second)
+	res2, err := eng.RunDirect(ctx, "RBK-DAMP-001", "target-service-damping")
+	if err == nil {
+		t.Fatalf("expected second execution to fail due to flap damping, got nil")
+	}
+	if !errors.Is(err, ErrPreconditionFail) {
+		t.Fatalf("expected ErrPreconditionFail, got: %v", err)
+	}
+	if res2.FinalState != model.StatePrecheckFailed {
+		t.Fatalf("expected final state PRECHECK_FAILED, got %s", res2.FinalState)
+	}
+	if !strings.Contains(res2.Error, "FLAP_DAMPING_BREACH") {
+		t.Fatalf("expected FLAP_DAMPING_BREACH in error, got: %s", res2.Error)
+	}
+	// Action must NOT have run
+	if execCount != 1 {
+		t.Fatalf("action must not execute when damping breached, execCount = %d", execCount)
+	}
+
+	// Verify Audit Ledger records FLAP_DAMPING_BREACH
+	report, err := audit.VerifyLedgerFile(auditPath)
+	if err != nil {
+		t.Fatalf("audit verification failed: %v", err)
+	}
+	if !report.Valid {
+		t.Fatalf("audit ledger is not valid")
+	}
+
+	// 3. Reset damping and verify execution succeeds again
+	eng.Damping().Reset("target-service-damping")
+	currentTime = baseTime.Add(350 * time.Second)
+	res3, err := eng.RunDirect(ctx, "RBK-DAMP-001", "target-service-damping")
+	if err != nil {
+		t.Fatalf("execution after Reset should succeed, got: %v", err)
+	}
+	if !res3.Success || res3.FinalState != model.StateCommitted {
+		t.Fatalf("expected COMMITTED after reset, got %s", res3.FinalState)
+	}
+	if execCount != 2 {
+		t.Fatalf("expected execCount == 2 after reset run, got %d", execCount)
 	}
 }

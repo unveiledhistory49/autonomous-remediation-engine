@@ -114,6 +114,14 @@ type Runbook struct {
 	Cooldown          time.Duration   `json:"cooldown,omitempty"`
 }
 
+// TargetResource returns the runbook's target resource identifier.
+func (r *Runbook) TargetResource() string {
+	if r == nil {
+		return ""
+	}
+	return r.TargetResourceID
+}
+
 // ExecutionResult captures the output, metrics, and exit status of an action.
 type ExecutionResult struct {
 	ExitCode     int           `json:"exit_code"`
