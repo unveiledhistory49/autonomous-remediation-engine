@@ -6,3 +6,6 @@ bin/
 *.wal
 *.lock
 coverage.out
+
+# Internal design documentation
+docs/
