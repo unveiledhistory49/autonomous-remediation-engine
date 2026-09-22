@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -50,6 +52,7 @@ type RemediationResult struct {
 
 // Engine implements the closed-loop control loop for autonomous remediation.
 type Engine struct {
+	cfg            EngineConfig
 	mu             sync.RWMutex
 	runbooks       map[string]*model.Runbook
 	lockCoord      *lock.Coordinator
@@ -86,6 +89,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	exec := executor.NewExecutor()
 
 	return &Engine{
+		cfg:            cfg,
 		runbooks:       make(map[string]*model.Runbook),
 		lockCoord:      lockCoord,
 		ledger:         ledger,
@@ -94,6 +98,59 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		executor:       exec,
 		damping:        dampingCtrl,
 	}, nil
+}
+
+// ProcessAlert processes an incoming alert with background context.
+func (e *Engine) ProcessAlert(alert *model.Alert) (*RemediationResult, error) {
+	return e.Remediate(context.Background(), alert)
+}
+
+// ProcessAlertContext processes an incoming alert with the provided context.
+func (e *Engine) ProcessAlertContext(ctx context.Context, alert *model.Alert) (*RemediationResult, error) {
+	return e.Remediate(ctx, alert)
+}
+
+// Ledger returns the engine's cryptographic audit ledger.
+func (e *Engine) Ledger() *audit.Ledger {
+	return e.ledger
+}
+
+// LockCoordinator returns the engine's resource lock coordinator.
+func (e *Engine) LockCoordinator() *lock.Coordinator {
+	return e.lockCoord
+}
+
+// Journal returns the engine's rollback journal.
+func (e *Engine) Journal() *rollback.Journal {
+	return e.journal
+}
+
+// Config returns the engine's configuration.
+func (e *Engine) Config() EngineConfig {
+	return e.cfg
+}
+
+// IsHealthy evaluates whether critical engine subsystems (lock dir, audit ledger) are operational.
+func (e *Engine) IsHealthy() (bool, string) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.ledger == nil {
+		return false, "audit ledger is not active"
+	}
+
+	if e.cfg.LockDir != "" {
+		if err := os.MkdirAll(e.cfg.LockDir, 0755); err != nil {
+			return false, fmt.Sprintf("lock directory %s cannot be created: %v", e.cfg.LockDir, err)
+		}
+		testFile := filepath.Join(e.cfg.LockDir, fmt.Sprintf(".healthcheck-%d", time.Now().UnixNano()))
+		if err := os.WriteFile(testFile, []byte("healthcheck"), 0600); err != nil {
+			return false, fmt.Sprintf("lock directory %s is not writable: %v", e.cfg.LockDir, err)
+		}
+		_ = os.Remove(testFile)
+	}
+
+	return true, "healthy"
 }
 
 // Damping returns the engine's flapping damping controller.
