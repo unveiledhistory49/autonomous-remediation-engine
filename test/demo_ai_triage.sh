@@ -34,9 +34,9 @@ fi
 
 # 2. Resolve NVIDIA API Key
 if [ -z "${NVIDIA_API_KEY:-}" ]; then
-    # Check if configured in ai-security-guardrail-proxy
-    if [ -f "/root/ai-security-guardrail-proxy/config.nvidia.yaml" ]; then
-        KEY_FOUND=$(grep "upstream_auth_token:" /root/ai-security-guardrail-proxy/config.nvidia.yaml | awk '{print $2}' | tr -d '"')
+    # Check if configured in local .env file
+    if [ -f "${REPO_ROOT}/.env" ]; then
+        KEY_FOUND=$(grep -E "^NVIDIA_API_KEY=" "${REPO_ROOT}/.env" | cut -d= -f2- | tr -d '"\x27')
         if [ -n "${KEY_FOUND}" ]; then
             export NVIDIA_API_KEY="${KEY_FOUND}"
         fi
@@ -44,7 +44,7 @@ if [ -z "${NVIDIA_API_KEY:-}" ]; then
 fi
 
 if [ -z "${NVIDIA_API_KEY:-}" ]; then
-    echo -e "${RED}[ERROR] NVIDIA_API_KEY is not set. Please set NVIDIA_API_KEY before running demo.${NC}" >&2
+    echo -e "${RED}[ERROR] NVIDIA_API_KEY is not set. Please export NVIDIA_API_KEY or set it in .env before running demo.${NC}" >&2
     exit 1
 fi
 
